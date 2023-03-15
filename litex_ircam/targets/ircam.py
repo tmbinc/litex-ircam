@@ -21,7 +21,9 @@ from litex.build.generic_platform import *
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
+from litex.soc.interconnect import stream
 from litex.soc.cores.led import LedChaser
+from litex.soc.cores.uart import UARTInterface
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -46,11 +48,18 @@ class _CRG(LiteXModule):
 # BaseSoC ------------------------------------------------------------------------------------------
 
 
-class UsbSerial(Module):
+class UsbSerial(Module, UARTInterface):
     def __init__(self, pads):
-        print("UTMI", pads)
-        CLK = Signal()
-        RESET = Signal()
+        Module.__init__(self)
+        UARTInterface.__init__(self)
+
+        self.clock_domains.cd_utmi = ClockDomain()
+
+        self.comb += [
+            self.cd_utmi.clk.eq(~pads.clkout),
+            self.cd_utmi.rst.eq(False),
+        ]
+
         USBRST = Signal()
         HIGHSPEED = Signal()
         ONLINE = Signal()
@@ -58,16 +67,33 @@ class UsbSerial(Module):
         RXDAT = Signal(8)
         RXRDY = Signal()
         RXLEN = Signal()
-        TXVAL = Signal(8)
+        TXDAT = Signal(8)
+        TXVAL = Signal()
         TXRDY = Signal()
         TXROOM = Signal()
         TXCORK = Signal()
 
+        # source write clock domain is USB,
+        depth = 8
+        self.submodules.fifo_source = ClockDomainsRenamer(
+            {"write": "utmi", "read": "sys"}
+        )(stream.AsyncFIFO([("data", 8)], depth))
+        self.submodules.fifo_sink = ClockDomainsRenamer(
+            {"write": "sys", "read": "utmi"}
+        )(stream.AsyncFIFO([("data", 8)], depth))
+
+        self.comb += self.fifo_source.source.connect(self.source)
+        self.comb += self.sink.connect(self.fifo_sink.sink)
+
         self.comb += [
-            CLK.eq(~pads.clkout),
-            RESET.eq(False),
-            TXVAL.eq(0),
-            TXVAL.eq(False),
+            # SINK (FIFO) -> USB
+            TXDAT.eq(self.fifo_sink.source.data),
+            TXVAL.eq(self.fifo_sink.source.valid),
+            self.fifo_sink.source.ready.eq(TXRDY),
+            # USB -> SOURCE (FIFO)
+            self.fifo_source.sink.data.eq(RXDAT),
+            self.fifo_source.sink.valid.eq(RXVAL),
+            RXRDY.eq(self.fifo_source.sink.ready),
             TXCORK.eq(False),
         ]
 
@@ -108,12 +134,12 @@ class UsbSerial(Module):
             p_VERSIONBCD=0xCCCC,
             p_VENDORSTR="Waldobjekt",
             p_PRODUCTSTR="IRCAM",
-            p_HSSUPPORT=True,
+            p_HSSUPPORT=False,
             p_SELFPOWERED=True,
             p_RXBUFSIZE_BITS=11,
             p_TXBUFSIZE_BITS=10,
-            i_CLK=CLK,
-            i_RESET=RESET,
+            i_CLK=self.cd_utmi.clk,
+            i_RESET=self.cd_utmi.rst,
             o_USBRST=USBRST,
             o_HIGHSPEED=HIGHSPEED,
             o_ONLINE=ONLINE,
@@ -122,6 +148,7 @@ class UsbSerial(Module):
             i_RXRDY=RXRDY,
             o_RXLEN=RXLEN,
             i_TXVAL=TXVAL,
+            i_TXDAT=TXDAT,
             o_TXRDY=TXRDY,
             o_TXROOM=TXROOM,
             i_TXCORK=TXCORK,
@@ -142,7 +169,12 @@ class UsbSerial(Module):
 
 class BaseSoC(SoCCore):
     def __init__(
-        self, sys_clk_freq=100e6, with_spi_flash=False, with_led_chaser=True, **kwargs
+        self,
+        sys_clk_freq=100e6,
+        with_spi_flash=False,
+        with_led_chaser=True,
+        with_uart=False,
+        **kwargs
     ):
         platform = ircam.Platform()
 
@@ -157,7 +189,7 @@ class BaseSoC(SoCCore):
             library="default",
         )
 
-        self.usb_serial = UsbSerial(pads=platform.request("utmi"))
+        self.submodules.usb_serial = UsbSerial(pads=platform.request("utmi"))
 
         # CRG --------------------------------------------------------------------------------------
         self.crg = _CRG(platform, sys_clk_freq)
@@ -166,6 +198,16 @@ class BaseSoC(SoCCore):
         SoCCore.__init__(
             self, platform, sys_clk_freq, ident="LiteX SoC on IRCAM Device", **kwargs
         )
+
+        from litex.soc.cores.uart import UART
+
+        self.uart = UART(self.usb_serial)
+
+        # IRQ.
+        if self.irq.enabled:
+            self.irq.add("uart", use_loc_if_exists=True)
+        else:
+            self.add_constant("UART_POLLING")
 
         # SPI Flash --------------------------------------------------------------------------------
         if with_spi_flash:
