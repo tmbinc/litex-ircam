@@ -288,7 +288,7 @@ class BaseSoC(SoCCore):
         sys_clk_freq=100e6,
         with_spi_flash=False,
         with_led_chaser=True,
-        with_uart=False,
+        with_uart=True,
         **kwargs
     ):
         platform = Platform()
@@ -316,13 +316,23 @@ class BaseSoC(SoCCore):
 
         from litex.soc.cores.uart import UART
 
-        self.uart = UART(self.usb_serial)
+        if with_uart:
+            # use USB as uartbone
 
-        # IRQ.
-        if self.irq.enabled:
-            self.irq.add("uart", use_loc_if_exists=True)
+            # Imports.
+            from litex.soc.cores import uart
+            self.check_if_exists("uartbone")
+            self.uartbone = uart.UARTBone(phy=self.usb_serial, clk_freq=self.sys_clk_freq, cd="sys")
+            self.bus.add_master(name="uartbone", master=self.uartbone.wishbone)
         else:
-            self.add_constant("UART_POLLING")
+            # use USB as main UART
+            self.uart = UART(self.usb_serial)
+
+            # IRQ.
+            if self.irq.enabled:
+                self.irq.add("uart", use_loc_if_exists=True)
+            else:
+                self.add_constant("UART_POLLING")
 
         # SPI Flash --------------------------------------------------------------------------------
         if with_spi_flash:
@@ -341,7 +351,7 @@ class BaseSoC(SoCCore):
 
         # SPI --------------------------------------------------------------------------------------
         pads = platform.request("canspi")
-        self.submodules.can_spi = SPIMaster(pads, 8, self.sys_clk_freq, 8e6)
+        self.submodules.spi = SPIMaster(pads, 48, self.sys_clk_freq, 8e6)
 
 
 # Build --------------------------------------------------------------------------------------------
