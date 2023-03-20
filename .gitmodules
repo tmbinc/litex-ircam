@@ -1,0 +1,3 @@
+[submodule "litex_ircam/software/micropython-mcp2515"]
+	path = litex_ircam/software/micropython-mcp2515
+	url = https://github.com/jxltom/micropython-mcp2515.git
