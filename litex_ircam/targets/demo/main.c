@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "md5.h"
 #include <irq.h>
 #include <libbase/uart.h>
 #include <libbase/console.h>
@@ -102,68 +103,12 @@ static void reboot_cmd(void)
     ctrl_reset_write(1);
 }
 
-#ifdef CSR_LEDS_BASE
-static void led_cmd(void)
-{
-    int i;
-    printf("Led demo...\n");
-
-    printf("Counter mode...\n");
-    for(i=0; i<32; i++) {
-        leds_out_write(i);
-        busy_wait(100);
-    }
-
-    printf("Shift mode...\n");
-    for(i=0; i<4; i++) {
-        leds_out_write(1<<i);
-        busy_wait(200);
-    }
-    for(i=0; i<4; i++) {
-        leds_out_write(1<<(3-i));
-        busy_wait(200);
-    }
-
-    printf("Dance mode...\n");
-    for(i=0; i<4; i++) {
-        leds_out_write(0x55);
-        busy_wait(200);
-        leds_out_write(0xaa);
-        busy_wait(200);
-    }
-}
-#endif
-
-extern void donut(void);
-
-static void donut_cmd(void)
-{
-    printf("Donut demo...\n");
-    donut();
-}
-
-extern void helloc(void);
-
-static void helloc_cmd(void)
-{
-    printf("Hello C demo...\n");
-    helloc();
-}
-
-#ifdef WITH_CXX
-extern void hellocpp(void);
-
-static void hellocpp_cmd(void)
-{
-    printf("Hello C++ demo...\n");
-    hellocpp();
-}
-#endif
-
 #define SPI_CONTROL_START   (1 << 0)
 #define SPI_CONTROL_LENGTH  (1 << 8)
 #define SPI_STATUS_DONE     (1 << 0)
 #define SPI_CS_MCP2515      (0)
+
+//#define DUMP_SPI
 
 static void spi_transfer(const uint8_t *tx, uint8_t *rx, int n)
 {
@@ -173,13 +118,19 @@ static void spi_transfer(const uint8_t *tx, uint8_t *rx, int n)
         
         // register is big-endian, MSB-first, left-aligned
         // So we need to swap byte order, but start at the first word.
+#ifdef DUMP_SPI
         printf("MOSI: ");
+#endif
         for (int i = 0; i < n; ++i) {
+#ifdef DUMP_SPI        
             printf("%02x ", tx[i]);
+#endif
             buf[i^3] = tx[i];
         }
+#ifdef DUMP_SPI        
         printf("\n");
-        
+#endif
+
         // Need to write as 32-bit
         *(volatile unsigned int*)(CSR_SPI_MOSI_ADDR + 0) = *(unsigned int*)(buf + 0);
         *(volatile unsigned int*)(CSR_SPI_MOSI_ADDR + 4) = *(unsigned int*)(buf + 4);
@@ -188,9 +139,10 @@ static void spi_transfer(const uint8_t *tx, uint8_t *rx, int n)
     }
 
     spi_control_write(((n * 8) * SPI_CONTROL_LENGTH) | SPI_CONTROL_START);
-    while (!(spi_control_read() & SPI_STATUS_DONE));
+    spi_control_read();
+    while (!(spi_status_read() & SPI_STATUS_DONE));
 
-    if (rx != NULL) {
+    /*if (rx != NULL)  */ {
         // MISO is big-endian, MSB-first but right-aligned.
         uint8_t buf[16] = {};
 
@@ -198,13 +150,19 @@ static void spi_transfer(const uint8_t *tx, uint8_t *rx, int n)
         *(unsigned int*)(buf + 4) = *(volatile unsigned int*)(CSR_SPI_MISO_ADDR + 4);
         *(unsigned int*)(buf + 8) = *(volatile unsigned int*)(CSR_SPI_MISO_ADDR + 8);
         *(unsigned int*)(buf + 12) = *(volatile unsigned int*)(CSR_SPI_MISO_ADDR + 12);
-        
+
+#ifdef DUMP_SPI        
         printf("MISO: ");
+#endif
         for (int i = 0; i < n; ++i) {
             rx[i] = buf[(16-n + i) ^ 3];
+#ifdef DUMP_SPI        
             printf("%02x ", rx[i]);
+#endif
         }
+#ifdef DUMP_SPI        
         printf("\n");
+#endif
     }
 }
 
@@ -361,7 +319,7 @@ static void mcp2515_set_regs(int reg, uint8_t *regs, int n)
 {
     uint8_t buf[16] = {INSTRUCTION_WRITE, reg};
     memcpy(buf + 2, regs, n);
-    spi_transfer(buf, 0, n);
+    spi_transfer(buf, 0, n + 2);
 }
 
 static void mcp2515_set(int reg, uint8_t val)
@@ -444,7 +402,6 @@ static void can_sendframe(int canid, uint8_t *msg, int len)
             }
 
             int ctrl = mcp2515_get(base + MCP_TXB0CTRL);
-            printf("txb %d ctrl %02x\n", txb, ctrl);
             if ((ctrl & TXB_TXREQ) == 0) {
                 uint8_t data[16];
                 mcp2515_id(data, canid);
@@ -518,22 +475,84 @@ static void isotp_send(int id, const uint8_t *msg, int len)
     }
 }
 
+static int isotp_receive(int id_rx, int id_tx, uint8_t *msg, int maxlen)
+{
+    int isolen = 0;
+    int offset = 0;
+    for (;;) {
+        uint8_t buf[8];
+        int can_id;
+        int dlc;
+        if (can_receive(&can_id, buf, &dlc)) {
+            printf("received %04x ", can_id);
+            for (int i = 0; i < dlc; ++i)
+            {
+                printf("%02x", buf[i]);
+            }
+            printf("\n");
+            if (can_id != id_rx) {
+                printf("not the right id\n"); // but i should really use a HW filter for this
+                continue;
+            }
+
+            if (buf[0] != (id_tx & 0xFF)) {
+                printf("not the right subid\n");
+                continue;
+            }
+
+            printf("buf1 %02x\n", buf[1]);
+
+            if ((buf[1] & 0xF0) == 0x00) {
+                isolen = buf[1] & 0xF;
+                if (isolen > maxlen || isolen > 6) continue;
+                memcpy(msg, buf + 2, isolen);
+                return isolen;
+            }
+
+            if ((buf[1] & 0xF0) == 0x10) {
+                isolen = (buf[1] & 0xF) << 4;
+                isolen |= buf[2];
+                printf("isolen now %d\n", isolen);
+                if (isolen > maxlen) continue;
+                memcpy(msg, buf + 3, 5);
+                offset = 5;
+            }
+
+            if ((buf[1] & 0xF0) == 0x20) {
+                int rem = isolen - offset;
+                if (rem > 6) rem = 6;
+                memcpy(msg + offset, buf + 2, rem);
+                offset += rem;
+                printf("now at %d / %d\n", offset, isolen);
+                if (offset == isolen) return isolen;
+            }
+
+            if ((buf[1] & 0xF0) == 0x30) {
+                uint8_t fc_buf[8] = {id_rx & 0xFF, 0x30, 0, 0, 0, 0, 0, 0};
+                can_sendframe(id_tx, fc_buf, 8);
+            }
+        }
+    }
+}
+
 static void uds_cmd(void)
 {
     printf("lol UDS\n");
     
     mcp2515_reset();
     printf("wait a bit\n");
+    for (volatile int i = 0; i < 1000000; ++i);
     
-    uint8_t zeros[14];
+    uint8_t zeros[14] = {};
     mcp2515_set_regs(MCP_TXB0CTRL, zeros, sizeof(zeros));
     mcp2515_set_regs(MCP_TXB1CTRL, zeros, sizeof(zeros));
     mcp2515_set_regs(MCP_TXB2CTRL, zeros, sizeof(zeros));
+
     mcp2515_set(MCP_RXB0CTRL, 0);
     mcp2515_set(MCP_RXB1CTRL, 0);
     mcp2515_set(MCP_CANINTE, CANINTF_RX0IF | CANINTF_RX1IF | CANINTF_ERRIF | CANINTF_MERRF);
-    mcp2515_rmw(MCP_RXB0CTRL, RXBnCTRL_RXM_MASK | RXB0CTRL_BUKT | RXB0CTRL_FILHIT_MASK, RXBnCTRL_RXM_STDEXT | RXB0CTRL_BUKT | RXB0CTRL_FILHIT);
-    mcp2515_rmw(MCP_RXB1CTRL, RXBnCTRL_RXM_MASK | RXB1CTRL_FILHIT_MASK, RXBnCTRL_RXM_STDEXT | RXB1CTRL_FILHIT);
+    mcp2515_rmw(MCP_RXB0CTRL, RXBnCTRL_RXM_MASK | RXB0CTRL_BUKT | RXB0CTRL_FILHIT_MASK, RXBnCTRL_RXM_MASK | RXB0CTRL_BUKT | RXB0CTRL_FILHIT);
+    mcp2515_rmw(MCP_RXB1CTRL, RXBnCTRL_RXM_MASK | RXB1CTRL_FILHIT_MASK, RXBnCTRL_RXM_MASK | RXB1CTRL_FILHIT);
     mcp2515_set_filter(MCP_RXF0SIDH, 0);
     mcp2515_set_filter(MCP_RXF1SIDH, 0);
     mcp2515_set_filter(MCP_RXF2SIDH, 0);
@@ -548,25 +567,64 @@ static void uds_cmd(void)
     mcp2515_set(MCP_CNF3, 0x86);
     
     mcp2515_set_mode(CANCTRL_REQOP_NORMAL);
-    uint8_t  get_sn[] = {0x27, 0x01};
-    isotp_send(0x657, get_sn, 2);
+    uint8_t  get_chal[] = {0x27, 0x01};
+    isotp_send(0x657, get_chal, 2);
+    uint8_t chal[0x40];
+    int chal_len = isotp_receive(0x68b, 0x657, chal, 0x40);
+    printf("received challenge %d\n", chal_len);
+    if (chal_len != 18) {
+        printf("challenge length invalid!\n");
+        return;
+    }
+    if (chal[0] != 0x67) {
+        printf("UDS response bad!\n");
+        return;
+    }
+    printf("CHAL: ");
+    for (int i = 0; i < chal_len; ++i) printf("%02x", chal[i]); 
+    printf("\n");
 
-    for (int i = 0; i < 100; ++i)
-    {
-        uint8_t buf[8];
-        int can_id;
-        int dlc;
-        if (can_receive(&can_id, buf, &dlc)) {
-            printf("received %04x ", can_id);
-            for (int i = 0; i < dlc; ++i)
-            {
-                printf("%02x", buf[i]);
-            }
-            printf("\n");
-            break;
-        }
+    const char *key_ascii = "JohanL & LennieA";
+    unsigned char block[64];
+    // generate i_key_pad
+    for (int i = 0; i < 64; ++i) {
+        block[i] = ((i < 16) ? key_ascii[i] : 0) ^ 0x36;
     }
 
+    unsigned char response[18];
+
+    response[0] = 0x27;
+    response[1] = 0x02;
+
+    MD5_CTX ctx;
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, block, 64);
+    MD5_Update(&ctx, chal + 2, 16);
+    MD5_Final(response + 2, &ctx);
+
+    // generate o_pad
+    for (int i = 0; i < 64; ++i) {
+        block[i] ^= 0x36 ^ 0x5c;
+    }
+    MD5_Init(&ctx);
+    MD5_Update(&ctx, block, 64);
+    MD5_Update(&ctx, response + 2, 16);
+    MD5_Final(response + 2, &ctx);
+
+    printf("RES: ");
+    for (int i = 0; i < sizeof(response); ++i) printf("%02x", response[i]); 
+    printf("\n");
+
+    isotp_send(0x657, response, sizeof(response));
+    chal_len = isotp_receive(0x68b, 0x657, response, sizeof(response));
+    for (int i = 0; i < chal_len; ++i) printf("%02x ", response[i]);
+
+    if ((response[0] == 0x67) && (response[1] == 0x02)) {
+        printf("Good!\n");
+    } else {
+        printf("Bad :(\n");
+    }
+    
 }
 
 /*-----------------------------------------------------------------------*/
@@ -585,18 +643,8 @@ static void console_service(void)
         help();
     else if(strcmp(token, "reboot") == 0)
         reboot_cmd();
-#ifdef CSR_LEDS_BASE
-    else if(strcmp(token, "led") == 0)
-        led_cmd();
-#endif
-    else if(strcmp(token, "helloc") == 0)
-        helloc_cmd();
     else if(strcmp(token, "uds") == 0)
         uds_cmd();
-#ifdef WITH_CXX
-    else if(strcmp(token, "hellocpp") == 0)
-        hellocpp_cmd();
-#endif
     prompt();
 }
 
