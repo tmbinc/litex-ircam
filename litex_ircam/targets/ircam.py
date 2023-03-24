@@ -20,6 +20,7 @@ from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
 from litex.soc.interconnect import stream
+from litex.soc.interconnect.csr import *
 from litex.soc.cores.led import LedChaser
 from litex.soc.cores.uart import UARTInterface
 from litex.soc.cores.spi import SPIMaster
@@ -91,6 +92,19 @@ _io = [
         Subsignal("int", Pins("J4")),
         IOStandard("3.3_V_LVTTL_/_LVCMOS"),
     ),
+    (
+        "deserializer",
+        0,
+        Subsignal(
+            "rout",
+            Pins(
+                "B6 A2 A3 B7 A4 A6 A7 A8 B5 B4 B3 C4 C5 C6 C7 C8 E7 E6 E5 E4 D8 D7 D6 D5"
+            ),
+        ),
+        Subsignal("lock", Pins("C3")),
+        Subsignal("npwrdn", Pins("D4")),
+        Subsignal("rclk", Pins("D10")),
+    ),
 ]
 
 # Bank voltage ---------------------------------------------------------------------------------------
@@ -161,6 +175,43 @@ class _CRG(LiteXModule):
 
 
 # BaseSoC ------------------------------------------------------------------------------------------
+
+
+class Deserializer(Module, AutoCSR):
+    def __init__(self, pads):
+        Module.__init__(self)
+
+        self._enable = CSRStorage(1, description="nPWRDN")
+        self._mux = CSRStorage(1, description="Mux to Pixel Traffic")
+
+        self.sink = stream.Endpoint([("data", 8)])
+        self.source = stream.Endpoint([("data", 8)])
+
+        self.clock_domains.cd_ser = ClockDomain()
+        self.comb += [
+            self.cd_ser.clk.eq(pads.rclk),
+            pads.npwrdn.eq(self._enable.storage),
+        ]
+
+        depth = 4
+        self.submodules.fifo_source = ClockDomainsRenamer(
+            {"write": "ser", "read": "sys"}
+        )(stream.AsyncFIFO([("data", 24)], depth))
+
+        # connect deserializer to FIFO
+        self.comb += [
+            self.fifo_source.sink.data.eq(pads.rout),
+            self.fifo_source.sink.valid.eq(pads.lock),
+        ]
+
+        self.comb += [
+            If(
+                self._mux.storage,
+                self.sink.connect(self.fifo_source.source),
+            ).Else(
+                self.sink.connect(self.source),
+            )
+        ]
 
 
 class UsbSerial(Module, UARTInterface):
@@ -285,7 +336,7 @@ class UsbSerial(Module, UARTInterface):
 class BaseSoC(SoCCore):
     def __init__(
         self,
-        sys_clk_freq=100e6,
+        sys_clk_freq=40e6,
         with_spi_flash=False,
         with_led_chaser=True,
         with_uart=True,
@@ -321,8 +372,11 @@ class BaseSoC(SoCCore):
 
             # Imports.
             from litex.soc.cores import uart
+
             self.check_if_exists("uartbone")
-            self.uartbone = uart.UARTBone(phy=self.usb_serial, clk_freq=self.sys_clk_freq, cd="sys")
+            self.uartbone = uart.UARTBone(
+                phy=self.usb_serial, clk_freq=self.sys_clk_freq, cd="sys"
+            )
             self.bus.add_master(name="uartbone", master=self.uartbone.wishbone)
         else:
             # use USB as main UART
@@ -333,6 +387,12 @@ class BaseSoC(SoCCore):
                 self.irq.add("uart", use_loc_if_exists=True)
             else:
                 self.add_constant("UART_POLLING")
+
+        # Deserializer -----------------------------------------------------------------------------
+
+        self.submodules.deserializer = Deserializer(
+            pads=platform.request("deserializer")
+        )
 
         # SPI Flash --------------------------------------------------------------------------------
         if with_spi_flash:
@@ -351,7 +411,7 @@ class BaseSoC(SoCCore):
 
         # SPI --------------------------------------------------------------------------------------
         pads = platform.request("canspi")
-        self.submodules.spi = SPIMaster(pads, 48, self.sys_clk_freq, 8e6)
+        self.submodules.spi = SPIMaster(pads, 128, self.sys_clk_freq, 1e6)
 
 
 # Build --------------------------------------------------------------------------------------------
